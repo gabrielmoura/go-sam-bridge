@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/go-i2p/go-i2p/lib/config"
 	"github.com/go-i2p/go-sam-bridge/lib/bridge"
 	"github.com/go-i2p/go-sam-bridge/lib/handler"
 	"github.com/go-i2p/go-sam-bridge/lib/i2cp"
@@ -16,14 +17,16 @@ import (
 
 // Default configuration values.
 const (
-	// DefaultListenAddr is the standard SAM port per SAMv3.md.
-	DefaultListenAddr = ":7656"
+	// DefaultListenAddr exposes SAM only on the local host. Applications that
+	// intentionally provide SAM to other hosts must opt in with WithListenAddr.
+	DefaultListenAddr = "127.0.0.1:7656"
 
 	// DefaultI2CPAddr is the standard I2CP port per I2CP spec.
 	DefaultI2CPAddr = "127.0.0.1:7654"
 
-	// DefaultDatagramPort is the standard SAM UDP port per SAMv3.md.
-	DefaultDatagramPort = 7655
+	// DefaultDatagramPort disables UDP by default. UDP is bound on every
+	// interface by the underlying bridge, so callers must opt in explicitly.
+	DefaultDatagramPort = 0
 
 	// DefaultEmbeddedRouterTimeout is the maximum time to wait for the embedded router.
 	DefaultEmbeddedRouterTimeout = 60 * time.Second
@@ -36,13 +39,13 @@ type HandlerRegistrarFunc func(router *handler.Router, deps *Dependencies)
 // Config holds the complete configuration for an embedded SAM bridge.
 // It extends bridge.Config with I2CP and embedding-specific settings.
 type Config struct {
-	// ListenAddr is the SAM TCP listen address (default ":7656").
+	// ListenAddr is the SAM TCP listen address (default "127.0.0.1:7656").
 	ListenAddr string
 
 	// I2CPAddr is the I2CP router address (default "127.0.0.1:7654").
 	I2CPAddr string
 
-	// DatagramPort is the UDP port for datagram forwarding (default 7655).
+	// DatagramPort is the UDP port for datagram forwarding (disabled by default).
 	DatagramPort int
 
 	// I2CPUsername for I2CP authentication (optional).
@@ -96,6 +99,12 @@ type Config struct {
 	// EmbeddedRouterTimeout is the maximum time to wait for the embedded router to become ready.
 	// Default is 60 seconds.
 	EmbeddedRouterTimeout time.Duration
+
+	// RouterConfig configures the router started by this bridge when no I2CP
+	// client or provider is supplied. Its top-level and I2CP values are copied
+	// before the I2CP listener address is set. Nested configuration is shared,
+	// so callers must treat it as immutable after passing it to the bridge.
+	RouterConfig *config.RouterConfig
 }
 
 // DefaultConfig returns a Config with sensible defaults.

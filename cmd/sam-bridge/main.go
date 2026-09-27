@@ -8,9 +8,9 @@
 //
 // Flags:
 //
-//	-listen string     SAM listen address (default ":7656")
+//	-listen string     SAM listen address (default "127.0.0.1:7656")
 //	-i2cp string       I2CP router address (default "127.0.0.1:7654")
-//	-udp string        UDP datagram port (default ":7655")
+//	-udp string        UDP datagram port (disabled by default)
 //	-debug             Enable debug logging
 //	-user string       I2CP username (optional)
 //	-pass string       I2CP password (optional)
@@ -35,14 +35,9 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/go-i2p/go-sam-bridge/lib/embedding"
-	"github.com/go-i2p/go-sam-bridge/lib/handler"
 	"github.com/go-i2p/go-sam-bridge/lib/i2cp"
-	"github.com/go-i2p/go-sam-bridge/lib/session"
-	samstreaming "github.com/go-i2p/go-sam-bridge/lib/streaming"
-	"github.com/go-i2p/go-streaming"
 	"github.com/go-i2p/logger"
 )
 
@@ -90,17 +85,17 @@ func main() {
 		log.WithFields(logger.Fields{"pkg": "main", "func": "main", "version": i2cpClient.RouterVersion()}).Info("Connected to I2P router")
 	}
 
-	// Build bridge options — I2CP provider is optional.
+	// Build bridge options. embedding wires a provider for an external client,
+	// or starts and manages a router plus client when no client was supplied.
 	opts := []embedding.Option{
 		embedding.WithListenAddr(cfg.ListenAddr),
 		embedding.WithI2CPAddr(cfg.I2CPAddr),
 		embedding.WithDatagramPort(datagramPort),
 		embedding.WithLogger(log),
 		embedding.WithDebug(cfg.Debug),
-		embedding.WithHandlerRegistrar(createHandlerRegistrar(i2cpClient)),
 	}
 	if i2cpClient != nil {
-		opts = append(opts, embedding.WithI2CPProvider(newI2CPProviderAdapter(i2cpClient)))
+		opts = append(opts, embedding.WithI2CPClient(i2cpClient))
 	}
 
 	// Create bridge with embedding API
@@ -141,9 +136,9 @@ type Config struct {
 func parseFlags() *Config {
 	cfg := &Config{}
 
-	flag.StringVar(&cfg.ListenAddr, "listen", ":7656", "SAM listen address")
+	flag.StringVar(&cfg.ListenAddr, "listen", embedding.DefaultListenAddr, "SAM listen address")
 	flag.StringVar(&cfg.I2CPAddr, "i2cp", "127.0.0.1:7654", "I2CP router address")
-	flag.StringVar(&cfg.UDPAddr, "udp", ":7655", "UDP datagram port")
+	flag.StringVar(&cfg.UDPAddr, "udp", "", "UDP datagram port (disabled by default)")
 	flag.BoolVar(&cfg.Debug, "debug", false, "Enable debug logging")
 	flag.StringVar(&cfg.Username, "user", "", "I2CP username (optional)")
 	flag.StringVar(&cfg.Password, "pass", "", "I2CP password (optional)")
@@ -220,123 +215,3 @@ func parseDatagramPort(addr string) int {
 	}
 	return embedding.DefaultDatagramPort
 }
-
-// createHandlerRegistrar returns a custom handler registrar with optional I2CP integration.
-// When i2cpClient is nil (no external I2P router), only default handlers are registered
-// and the embedded router fallback handles connectivity.
-func createHandlerRegistrar(i2cpClient *i2cp.Client) embedding.HandlerRegistrarFunc {
-	return func(router *handler.Router, deps *embedding.Dependencies) {
-		log := deps.Logger
-		const pkg = "main"
-		const fn = "createHandlerRegistrar"
-
-		// Use default handler registrar for base handlers
-		embedding.DefaultHandlerRegistrar()(router, deps)
-
-		// Without an I2CP client, default handlers are sufficient.
-		// The embedded router will wire transport once it is ready.
-		if i2cpClient == nil {
-			log.WithFields(logger.Fields{"pkg": pkg, "func": fn}).Info("No I2CP client: using default handlers (embedded router mode)")
-			return
-		}
-
-		streamConnector := handler.NewStreamingConnector()
-		streamAcceptor := handler.NewStreamingAcceptor()
-		streamForwarder := handler.NewStreamingForwarder()
-
-		sessionHandler := handler.NewSessionHandler(deps.DestManager)
-		sessionHandler.SetI2CPProvider(deps.I2CPProvider)
-
-		// Set session created callback for StreamManager wiring
-		sessionHandler.SetSessionCreatedCallback(func(sess session.Session, i2cpHandle session.I2CPSessionHandle) {
-			if sess.Style() != session.StyleStream || i2cpHandle == nil {
-				return
-			}
-
-			i2cpSess, ok := i2cpHandle.(*i2cp.I2CPSession)
-			if !ok {
-				log.WithFields(logger.Fields{"pkg": pkg, "func": fn, "sessionID": sess.ID()}).Warn("Cannot create StreamManager: invalid I2CP session type")
-				return
-			}
-
-			underlyingSession := i2cpSess.Session()
-			underlyingClient := i2cpClient.I2CPClient()
-			if underlyingSession == nil || underlyingClient == nil {
-				log.WithFields(logger.Fields{"pkg": pkg, "func": fn, "sessionID": sess.ID()}).Warn("Cannot create StreamManager: no underlying I2CP session/client")
-				return
-			}
-
-			streamManager, err := streaming.NewStreamManagerFromSession(underlyingClient, underlyingSession)
-			if err != nil {
-				log.WithFields(logger.Fields{"pkg": pkg, "func": fn, "sessionID": sess.ID()}).WithError(err).Warn("Failed to create StreamManager from session")
-				return
-			}
-
-			adapter, err := samstreaming.NewAdapter(streamManager)
-			if err != nil {
-				log.WithFields(logger.Fields{"pkg": pkg, "func": fn, "sessionID": sess.ID()}).WithError(err).Warn("Failed to create StreamManager adapter")
-				return
-			}
-
-			streamConnector.RegisterManager(sess.ID(), adapter)
-			streamAcceptor.RegisterManager(sess.ID(), adapter)
-			streamForwarder.RegisterManager(sess.ID(), adapter)
-
-			log.WithFields(logger.Fields{"pkg": pkg, "func": fn, "sessionID": sess.ID()}).Debug("Registered StreamManager for STREAM session")
-		})
-
-		// Re-register SESSION handlers with extended callback
-		router.Register("SESSION CREATE", sessionHandler)
-		router.Register("SESSION ADD", sessionHandler)
-		router.Register("SESSION REMOVE", sessionHandler)
-
-		// Re-register STREAM handlers with new connectors
-		streamHandler := handler.NewStreamHandler(streamConnector, streamAcceptor, streamForwarder)
-		router.Register("STREAM CONNECT", streamHandler)
-		router.Register("STREAM ACCEPT", streamHandler)
-		router.Register("STREAM FORWARD", streamHandler)
-
-		// Wire destination resolver for NAMING handler
-		destResolver, err := i2cp.NewClientDestinationResolverAdapter(i2cpClient, 30*time.Second)
-		if err == nil {
-			namingHandler := handler.NewNamingHandler(deps.DestManager)
-			namingHandler.SetDestinationResolver(destResolver)
-			router.Register("NAMING LOOKUP", namingHandler)
-			log.WithFields(logger.Fields{"pkg": pkg, "func": fn}).Debug("Wired destination resolver to NAMING handler")
-		}
-
-		log.WithFields(logger.Fields{"pkg": pkg, "func": fn}).Debug("Extended handlers with I2CP integration")
-	}
-}
-
-// i2cpProviderAdapter wraps i2cp.Client to implement session.I2CPSessionProvider.
-type i2cpProviderAdapter struct {
-	client *i2cp.Client
-}
-
-func newI2CPProviderAdapter(client *i2cp.Client) *i2cpProviderAdapter {
-	return &i2cpProviderAdapter{client: client}
-}
-
-func (a *i2cpProviderAdapter) CreateSessionForSAM(ctx context.Context, samSessionID string, config *session.SessionConfig) (session.I2CPSessionHandle, error) {
-	i2cpConfig := &i2cp.SessionConfigFromSession{
-		SignatureType:          config.SignatureType,
-		EncryptionTypes:        config.EncryptionTypes,
-		InboundQuantity:        config.InboundQuantity,
-		OutboundQuantity:       config.OutboundQuantity,
-		InboundLength:          config.InboundLength,
-		OutboundLength:         config.OutboundLength,
-		InboundBackupQuantity:  config.InboundBackupQuantity,
-		OutboundBackupQuantity: config.OutboundBackupQuantity,
-		FastReceive:            config.FastReceive,
-		ReduceIdleTime:         config.ReduceIdleTime,
-		CloseIdleTime:          config.CloseIdleTime,
-	}
-	return a.client.CreateSessionForSAM(ctx, samSessionID, i2cpConfig)
-}
-
-func (a *i2cpProviderAdapter) IsConnected() bool {
-	return a.client.IsConnected()
-}
-
-var _ session.I2CPSessionProvider = (*i2cpProviderAdapter)(nil)

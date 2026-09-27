@@ -65,5 +65,12 @@ func newDependencies(cfg *Config) *Dependencies {
 		}
 	}
 
+	// A caller-supplied client is sufficient for the standard handlers. Keep
+	// caller ownership intact; lifecycle management only closes clients created
+	// by Bridge itself.
+	if deps.I2CPProvider == nil && deps.I2CPClient != nil {
+		deps.I2CPProvider = newI2CPProviderAdapter(deps.I2CPClient)
+	}
+
 	return deps
 }

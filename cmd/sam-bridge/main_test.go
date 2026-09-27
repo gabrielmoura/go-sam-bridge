@@ -5,11 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/go-i2p/go-sam-bridge/lib/destination"
 	"github.com/go-i2p/go-sam-bridge/lib/embedding"
-	"github.com/go-i2p/go-sam-bridge/lib/handler"
-	"github.com/go-i2p/go-sam-bridge/lib/session"
-	"github.com/go-i2p/logger"
 )
 
 // TestParseDatagramPort verifies boundary cases for parseDatagramPort.
@@ -54,14 +50,14 @@ func TestParseFlags_Defaults(t *testing.T) {
 
 	cfg := parseFlags()
 
-	if cfg.ListenAddr != ":7656" {
-		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, ":7656")
+	if cfg.ListenAddr != embedding.DefaultListenAddr {
+		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, embedding.DefaultListenAddr)
 	}
 	if cfg.I2CPAddr != "127.0.0.1:7654" {
 		t.Errorf("I2CPAddr = %q, want %q", cfg.I2CPAddr, "127.0.0.1:7654")
 	}
-	if cfg.UDPAddr != ":7655" {
-		t.Errorf("UDPAddr = %q, want %q", cfg.UDPAddr, ":7655")
+	if cfg.UDPAddr != "" {
+		t.Errorf("UDPAddr = %q, want empty disabled value", cfg.UDPAddr)
 	}
 	if cfg.Debug {
 		t.Error("Debug should be false by default")
@@ -107,30 +103,3 @@ func TestParseFlags_EnvVarOverrides(t *testing.T) {
 
 // TestCreateHandlerRegistrar_RouterKeys verifies that createHandlerRegistrar registers
 // the minimum required router keys: SESSION CREATE, STREAM CONNECT, NAMING LOOKUP.
-func TestCreateHandlerRegistrar_RouterKeys(t *testing.T) {
-	// Build minimal dependencies — no live I2CP router needed.
-	deps := &embedding.Dependencies{
-		Registry:     session.NewRegistry(),
-		DestManager:  destination.NewManager(),
-		DatagramPort: embedding.DefaultDatagramPort,
-		Logger:       logger.GetGoI2PLogger(),
-	}
-
-	router := handler.NewRouter()
-
-	// Pass nil for i2cpClient; createHandlerRegistrar handles nil gracefully
-	// (NewClientDestinationResolverAdapter returns error for nil, which is handled).
-	registrar := createHandlerRegistrar(nil)
-	registrar(router, deps)
-
-	required := []string{
-		"SESSION CREATE",
-		"STREAM CONNECT",
-		"NAMING LOOKUP",
-	}
-	for _, key := range required {
-		if !router.HasHandler(key) {
-			t.Errorf("router missing required handler for key %q", key)
-		}
-	}
-}

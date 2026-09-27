@@ -2,6 +2,7 @@ package embedding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/go-i2p/go-sam-bridge/lib/bridge"
 	"github.com/go-i2p/go-sam-bridge/lib/datagram"
+	"github.com/go-i2p/go-sam-bridge/lib/i2cp"
 )
 
 // Lifecycle defines the interface for controlling a Bridge.
@@ -41,6 +43,7 @@ type Bridge struct {
 	server         *bridge.Server
 	embeddedRouter embedded.EmbeddedRouter
 	udpListener    *datagram.UDPListener
+	ownsI2CPClient bool
 
 	mu       sync.Mutex
 	running  atomic.Bool
@@ -64,14 +67,19 @@ func New(opts ...Option) (*Bridge, error) {
 
 	deps := newDependencies(cfg)
 
-	server, err := createServer(cfg, deps)
-	if err != nil {
-		return nil, err
-	}
-
 	embeddedRouter, err := createEmbeddedRouter(cfg)
 	if err != nil {
 		return nil, err
+	}
+	// An externally supplied I2CP transport is ready before Start, so preserve
+	// the historical API where Server is available immediately after New. For a
+	// managed router, handlers must wait until its I2CP client is connected.
+	var server *bridge.Server
+	if embeddedRouter == nil {
+		server, err = createServer(cfg, deps)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create UDP listener for datagram port 7655 if configured
@@ -131,24 +139,37 @@ func registerHandlers(cfg *Config, server *bridge.Server, deps *Dependencies) {
 
 // createEmbeddedRouter creates an embedded router if needed.
 func createEmbeddedRouter(cfg *Config) (embedded.EmbeddedRouter, error) {
-	bridgeConfig := cfg.toBridgeConfig()
-	if !checkPortAvailable(bridgeConfig.I2CPAddr) {
+	// An injected transport belongs to the caller and indicates an external
+	// router. Otherwise this bridge owns a router and its I2CP connection.
+	if cfg.I2CPProvider != nil || cfg.I2CPClient != nil {
 		return nil, nil
 	}
 
-	routercfg := config.DefaultRouterConfig()
-	routercfg.I2CP.Address = bridgeConfig.I2CPAddr
+	routercfg := copyRouterConfig(cfg.RouterConfig)
+	routercfg.I2CP.Address = cfg.I2CPAddr
 
 	router, err := embedded.NewStandardEmbeddedRouter(routercfg)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := router.Configure(routercfg); err != nil {
-		return nil, err
+	return router, nil
+}
+
+func copyRouterConfig(source *config.RouterConfig) *config.RouterConfig {
+	if source == nil {
+		source = config.DefaultRouterConfig()
 	}
 
-	return router, nil
+	copy := *source
+	if source.I2CP == nil {
+		defaultI2CP := config.DefaultI2CPConfig
+		copy.I2CP = &defaultI2CP
+	} else {
+		i2cpConfig := *source.I2CP
+		copy.I2CP = &i2cpConfig
+	}
+	return &copy
 }
 
 // Start begins serving SAM connections.
@@ -162,7 +183,12 @@ func (b *Bridge) Start(ctx context.Context) error {
 		return ErrBridgeAlreadyRunning
 	}
 
-	if err := b.startEmbeddedRouter(); err != nil {
+	if err := b.startEmbeddedRouter(ctx); err != nil {
+		b.cleanupStartupResources()
+		return err
+	}
+	if err := b.createServer(); err != nil {
+		b.cleanupStartupResources()
 		return err
 	}
 
@@ -184,8 +210,7 @@ func (b *Bridge) Start(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bridge) startEmbeddedRouter() error {
-	// Only start embedded router if we created one (port was available during New()).
+func (b *Bridge) startEmbeddedRouter(ctx context.Context) error {
 	if b.embeddedRouter == nil {
 		return nil
 	}
@@ -198,15 +223,59 @@ func (b *Bridge) startEmbeddedRouter() error {
 	if timeout <= 0 {
 		timeout = DefaultEmbeddedRouterTimeout
 	}
-	deadline := time.Now().Add(timeout)
-	for checkPortAvailable(b.config.I2CPAddr) {
-		if time.Now().After(deadline) {
-			return ErrEmbeddedRouterTimeout
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := b.connectManagedI2CP(readyCtx); err != nil {
+		switch {
+		case errors.Is(readyCtx.Err(), context.DeadlineExceeded):
+			return fmt.Errorf("%w: %w", ErrEmbeddedRouterTimeout, err)
+		case readyCtx.Err() != nil:
+			return fmt.Errorf("embedded router startup cancelled: %w", readyCtx.Err())
 		}
-		time.Sleep(500 * time.Millisecond)
+		return err
 	}
 
 	b.deps.Logger.WithFields(logger.Fields{"pkg": "embedding", "func": "Bridge.startEmbeddedRouter"}).Info("Embedded router started")
+	return nil
+}
+
+func (b *Bridge) connectManagedI2CP(ctx context.Context) error {
+	var lastErr error
+	for {
+		clientConfig := i2cp.DefaultClientConfig()
+		clientConfig.RouterAddr = b.config.I2CPAddr
+		clientConfig.Username = b.config.I2CPUsername
+		clientConfig.Password = b.config.I2CPPassword
+		clientConfig.ConnectTimeout = time.Second
+		client := i2cp.NewClient(clientConfig)
+		if err := client.Connect(ctx); err == nil {
+			b.deps.I2CPClient = client
+			b.deps.I2CPProvider = newI2CPProviderAdapter(client)
+			b.ownsI2CPClient = true
+			return nil
+		} else {
+			lastErr = err
+			_ = client.Close()
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %w", ErrI2CPConnectFailed, lastErr)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func (b *Bridge) createServer() error {
+	if b.server != nil {
+		return nil
+	}
+
+	server, err := createServer(b.config, b.deps)
+	if err != nil {
+		return err
+	}
+	b.server = server
 	return nil
 }
 
@@ -268,9 +337,23 @@ func (b *Bridge) cleanupStartupResources() {
 	if b.udpListener != nil {
 		_ = b.udpListener.Close()
 	}
+	b.closeManagedI2CP()
 	if b.embeddedRouter != nil {
 		_ = b.embeddedRouter.Stop()
+		_ = b.embeddedRouter.Close()
 	}
+}
+
+func (b *Bridge) closeManagedI2CP() {
+	if !b.ownsI2CPClient || b.deps.I2CPClient == nil {
+		return
+	}
+	if err := b.deps.I2CPClient.Close(); err != nil {
+		b.deps.Logger.WithFields(logger.Fields{"pkg": "embedding", "func": "Bridge.closeManagedI2CP"}).WithError(err).Warn("Error closing managed I2CP client")
+	}
+	b.deps.I2CPClient = nil
+	b.deps.I2CPProvider = nil
+	b.ownsI2CPClient = false
 }
 
 func (b *Bridge) watchContext(ctx context.Context) {
@@ -317,12 +400,17 @@ func (b *Bridge) Stop(ctx context.Context) error {
 			}
 		}
 
+		b.closeManagedI2CP()
+
 		b.deps.Logger.WithFields(logger.Fields{"pkg": "embedding", "func": "Bridge.Stop"}).Info("SAM bridge stopped")
 
 		// Stop embedded router if we started one
 		if b.embeddedRouter != nil {
 			if err := b.embeddedRouter.Stop(); err != nil {
 				b.deps.Logger.WithFields(logger.Fields{"pkg": "embedding", "func": "Bridge.Stop"}).WithError(err).Warn("Error stopping embedded router")
+			}
+			if err := b.embeddedRouter.Close(); err != nil {
+				b.deps.Logger.WithFields(logger.Fields{"pkg": "embedding", "func": "Bridge.Stop"}).WithError(err).Warn("Error closing embedded router")
 			}
 			b.deps.Logger.WithFields(logger.Fields{"pkg": "embedding", "func": "Bridge.Stop"}).Info("Embedded router stopped")
 		}

@@ -6,8 +6,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-i2p/go-i2p/lib/config"
+	"github.com/go-i2p/go-sam-bridge/lib/i2cp"
 	"github.com/go-i2p/go-sam-bridge/lib/session"
 )
+
+func TestCopyRouterConfig_CopiesI2CPConfig(t *testing.T) {
+	source := config.DefaultRouterConfig()
+	sourceI2CPAddress := source.I2CP.Address
+
+	copy := copyRouterConfig(source)
+	copy.I2CP.Address = "127.0.0.1:17654"
+
+	if source.I2CP.Address != sourceI2CPAddress {
+		t.Fatal("copyRouterConfig modified the caller's I2CP configuration")
+	}
+	if copy == source || copy.I2CP == source.I2CP {
+		t.Fatal("copyRouterConfig must not share the router or I2CP config")
+	}
+}
+
+func TestNewDependencies_UsesProvidedClientAsProvider(t *testing.T) {
+	client := i2cp.NewClient(nil)
+	deps := newDependencies(&Config{
+		I2CPClient: client,
+		AuthUsers:  map[string]string{},
+	})
+
+	if deps.I2CPClient != client {
+		t.Fatal("I2CP client was not retained")
+	}
+	if deps.I2CPProvider == nil {
+		t.Fatal("provided I2CP client was not adapted as a session provider")
+	}
+}
 
 // mockRegistry implements session.Registry for testing.
 type mockRegistry struct {

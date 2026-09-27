@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/go-i2p/go-i2p/lib/config"
 	"github.com/go-i2p/go-sam-bridge/lib/handler"
 	"github.com/go-i2p/go-sam-bridge/lib/i2cp"
 	"github.com/go-i2p/go-sam-bridge/lib/session"
@@ -15,7 +16,7 @@ import (
 type Option func(*Config)
 
 // WithListenAddr sets the SAM TCP listen address.
-// Default is ":7656" per SAMv3.md.
+// Default is loopback-only ("127.0.0.1:7656").
 func WithListenAddr(addr string) Option {
 	return func(c *Config) {
 		c.ListenAddr = addr
@@ -31,7 +32,7 @@ func WithI2CPAddr(addr string) Option {
 }
 
 // WithDatagramPort sets the UDP port for datagram forwarding.
-// Default is 7655 per SAMv3.md.
+// Default is disabled; callers opt in explicitly.
 func WithDatagramPort(port int) Option {
 	return func(c *Config) {
 		c.DatagramPort = port
@@ -137,5 +138,14 @@ func WithDebug(enabled bool) Option {
 func WithEmbeddedRouterTimeout(timeout time.Duration) Option {
 	return func(c *Config) {
 		c.EmbeddedRouterTimeout = timeout
+	}
+}
+
+// WithRouterConfig sets the configuration for a router managed by the bridge.
+// The top-level and I2CP values are copied when the embedded router is created;
+// nested configuration must remain immutable while the bridge is running.
+func WithRouterConfig(cfg *config.RouterConfig) Option {
+	return func(c *Config) {
+		c.RouterConfig = cfg
 	}
 }

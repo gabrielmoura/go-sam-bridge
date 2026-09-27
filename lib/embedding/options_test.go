@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"github.com/go-i2p/go-i2p/lib/config"
 	"github.com/go-i2p/go-sam-bridge/lib/handler"
 	"github.com/go-i2p/logger"
 )
@@ -63,6 +64,16 @@ func TestWithI2CPProvider(t *testing.T) {
 
 	if cfg.I2CPProvider != mockProv {
 		t.Error("I2CPProvider not set correctly")
+	}
+}
+
+func TestWithRouterConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	routerConfig := config.DefaultRouterConfig()
+	WithRouterConfig(routerConfig)(cfg)
+
+	if cfg.RouterConfig != routerConfig {
+		t.Error("RouterConfig not set correctly")
 	}
 }
 
